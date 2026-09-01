@@ -13,6 +13,9 @@ v5 = []
 defmt = ["dep:defmt"]
 log = ["dep:log"]
 esp32-log = ["dep:esp-println"]
+# embassy-net 传输（no_std/embassy 目标，如 ESP32）。std 平台（RV1106 Linux）
+# 走自定义 StdTcpTransport，不启用此 feature，避免拉入 embassy-executor-timer-queue。
+embassy-net = ["dep:embassy-net"]
 
 [dependencies]
 log = { version = "0.4", optional = true }
@@ -20,14 +23,17 @@ embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
 embedded-io-async = "0.6.1"
 heapless = "0.9"
-embassy-time = "0.5.0"
+# std：启用 std 时间源；generic-queue-8：选用通用定时器队列实现，避免
+# embassy-time-queue-utils 的集成队列依赖 __embassy_time_queue_item_from_waker
+# （该符号本应由 embassy-executor 提供，本项目用 futures::block_on 不依赖 executor）。
+embassy-time = { version = "0.5.0", features = ["std", "generic-queue-8"] }
 embassy-sync = "0.7.2"
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.7.1", features = [
     "tcp",
     "medium-ethernet",
     "proto-ipv4",
-]}
+], optional = true }
 futures = { version = "0.3.30", default-features = false }
 defmt = { version = "0.3", optional = true }
 esp-println = { version = "0.16.1", optional = true, default-features = false }

@@ -81,4 +81,5 @@ pub mod util;
 // Re-export key types for easier access at the crate root.
 pub use client::{LastWill, MqttClient, MqttEvent, MqttOptions};
 pub use packet::QoS;
+#[cfg(feature = "embassy-net")]
 pub use transport::TcpTransport;

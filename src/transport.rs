@@ -8,8 +8,11 @@
 //! need for the `#[async_trait]` macro.
 
 use crate::error::MqttError;
+#[cfg(feature = "embassy-net")]
 use embassy_net::tcp::{Error as TcpError, TcpSocket};
+#[cfg(feature = "embassy-net")]
 use embassy_time::{Duration, Timer};
+#[cfg(feature = "embassy-net")]
 use embedded_io_async::Write;
 
 /// A placeholder error type used in contexts where the actual transport error is not known,
@@ -43,14 +46,17 @@ pub trait TransportError: core::fmt::Debug {}
 impl<T: core::fmt::Debug> TransportError for MqttError<T> {}
 
 // Implement TransportError for embassy_net tcp error
+#[cfg(feature = "embassy-net")]
 impl TransportError for TcpError {}
 
 /// TCP transport implementation using `embassy-net`.
+#[cfg(feature = "embassy-net")]
 pub struct TcpTransport<'a> {
     socket: TcpSocket<'a>,
     timeout: Duration,
 }
 
+#[cfg(feature = "embassy-net")]
 impl<'a> TcpTransport<'a> {
     /// Creates a new `TcpTransport` with the given socket and timeout.
     pub fn new(socket: TcpSocket<'a>, timeout: Duration) -> Self {
@@ -99,6 +105,7 @@ impl<'a> TcpTransport<'a> {
     }
 }
 
+#[cfg(feature = "embassy-net")]
 impl<'a> MqttTransport for TcpTransport<'a> {
     type Error = MqttError<embassy_net::tcp::Error>;
 

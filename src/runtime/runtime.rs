@@ -49,7 +49,7 @@ pub struct MqttRuntime<
     const OUTBOX_DEPTH: usize,
 > where
     T: MqttTransport,
-    M: MqttModule<MAX_TOPICS>,
+    M: MqttModule,
 {
     client: MqttClient<'a, T, MAX_TOPICS, BUF_SIZE>,
     module: M,

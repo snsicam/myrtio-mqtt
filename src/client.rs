@@ -36,6 +36,7 @@ pub struct MqttOptions<'a> {
     client_id: &'a str,
     version: MqttVersion,
     keep_alive: Duration,
+    clean_session: bool,
     username: Option<String<32>>,
     password: Option<String<64>>,
     will: Option<LastWill<'a>>,
@@ -47,10 +48,20 @@ impl<'a> MqttOptions<'a> {
             client_id,
             version: MqttVersion::V3,
             keep_alive: Duration::from_secs(60),
+            clean_session: true,
             username: None,
             password: None,
             will: None,
         }
+    }
+
+    /// Sets the MQTT Clean Session flag.
+    ///
+    /// `false` keeps the broker-side session across reconnects (delivers
+    /// offline QoS1 messages), as required by MXS protocol V2.1.2.
+    pub fn with_clean_session(mut self, clean_session: bool) -> Self {
+        self.clean_session = clean_session;
+        self
     }
     #[cfg(feature = "v5")]
     pub fn with_version(mut self, version: MqttVersion) -> Self {
@@ -179,7 +190,7 @@ where
         let connect_packet = Connect::with_credentials(
             self.options.client_id,
             self.options.keep_alive.as_secs() as u16,
-            true,
+            self.options.clean_session,
             self.options.username.as_deref(),
             self.options.password.as_ref().map(|s| s.as_bytes()),
             will,
