@@ -6,7 +6,9 @@
 use crate::error::{MqttError, ProtocolError};
 use crate::packet::{self, Connect, EncodePacket, MqttPacket, PingReq, Publish, QoS, Subscribe};
 use crate::transport::{self, MqttTransport};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
+#[cfg(not(feature = "std"))]
+use embassy_time::Timer;
 use heapless::{String, Vec};
 
 /// Represents the MQTT protocol version used by the client.
@@ -383,9 +385,16 @@ where
 
     /// Polls the connection for incoming packets and handles keep-alives.
     ///
+    /// `max_wait` 是本次轮询的上限（由 runtime 传入 tick 截止时间）。std 构建下，保活与 tick
+    /// 均按真实时钟推进（不再依赖 embassy-time 的 `Timer`，后者在 `futures::block_on` 下不触发）；
+    /// no_std/embassy 构建下 `max_wait` 被忽略，保活改由内部 `Timer` 驱动。
+    ///
     /// The returned `MqttEvent` contains references to the client's internal receive
     /// buffer. These references are only valid until the next call to `poll`.
-    pub async fn poll<'p>(&'p mut self) -> Result<Option<MqttEvent<'p>>, MqttError<T::Error>>
+    pub async fn poll<'p>(
+        &'p mut self,
+        max_wait: Duration,
+    ) -> Result<Option<MqttEvent<'p>>, MqttError<T::Error>>
     where
         T::Error: transport::TransportError,
     {
@@ -393,28 +402,61 @@ where
             return Err(MqttError::NotConnected);
         }
 
-        let elapsed = self.last_tx_time.elapsed();
-        let remaining = if elapsed >= self.options.keep_alive {
-            Duration::from_millis(0)
-        } else {
-            self.options.keep_alive - elapsed
-        };
-
         enum PollDecision {
             Received(usize),
             KeepAlive,
+            Idle,
         }
 
         let decision = {
-            let recv_fut = self.transport.recv(&mut self.rx_buffer);
-            let timer_fut = Timer::after(remaining);
-            match futures::future::select(core::pin::pin!(recv_fut), core::pin::pin!(timer_fut))
-                .await
+            #[cfg(feature = "std")]
             {
-                futures::future::Either::Left((result, _)) => result.map(PollDecision::Received),
-                futures::future::Either::Right(((), _pending_recv)) => Ok(PollDecision::KeepAlive),
+                // std 路径：用 recv 超时 + 真实时钟保活，避免 embassy-time Timer 在
+                // futures::block_on 下不触发导致永不发 PINGREQ / 周期 tick 不跑。
+                let keepalive_due = self.last_tx_time.elapsed() >= self.options.keep_alive;
+                let wait: std::time::Duration = if keepalive_due {
+                    std::time::Duration::from_millis(0)
+                } else {
+                    let rem = self.options.keep_alive - self.last_tx_time.elapsed();
+                    std::time::Duration::from(rem)
+                }
+                .min(std::time::Duration::from(max_wait));
+
+                match self.transport.recv_timeout(&mut self.rx_buffer, wait).await {
+                    Ok(0) => {
+                        // 空闲超时：若已达保活时刻则发 PINGREQ，否则视为 tick 唤醒（Idle）。
+                        if self.last_tx_time.elapsed() >= self.options.keep_alive {
+                            PollDecision::KeepAlive
+                        } else {
+                            PollDecision::Idle
+                        }
+                    }
+                    Ok(n) => PollDecision::Received(n),
+                    Err(e) => return Err(e.into()),
+                }
             }
-        }?;
+            #[cfg(not(feature = "std"))]
+            {
+                let elapsed = self.last_tx_time.elapsed();
+                let remaining = if elapsed >= self.options.keep_alive {
+                    Duration::from_millis(0)
+                } else {
+                    self.options.keep_alive - elapsed
+                };
+
+                let recv_fut = self.transport.recv(&mut self.rx_buffer);
+                let timer_fut = Timer::after(remaining);
+                match futures::future::select(core::pin::pin!(recv_fut), core::pin::pin!(timer_fut))
+                    .await
+                {
+                    futures::future::Either::Left((result, _)) => match result {
+                        Ok(n) => PollDecision::Received(n),
+                        Err(_) => PollDecision::Idle,
+                    },
+                    futures::future::Either::Right(((), _pending_recv)) => PollDecision::KeepAlive,
+                }
+            }
+        };
 
         match decision {
             PollDecision::Received(n) => {
@@ -438,6 +480,7 @@ where
                 esp_println::println!("MQTT: PINGREQ sent");
                 Ok(None)
             }
+            PollDecision::Idle => Ok(None),
         }
     }
 

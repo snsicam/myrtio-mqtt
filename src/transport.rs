@@ -34,6 +34,17 @@ pub trait MqttTransport {
     ///
     /// Returns the number of bytes read.
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
+
+    /// 带超时的接收：至多阻塞 `timeout` 时间，超时且无数据时返回 `Ok(0)`（由调用方视为空闲）。
+    ///
+    /// 仅 std 构建（RV1106 Linux）启用：`StdTcpTransport` 用 socket 读超时实现真实定时，
+    /// 使保活/周期 tick 在 `futures::block_on` 下照常工作（embassy-time 的 `Timer` 在此模型下
+    /// 不会触发）。无 std 时默认退化为 `recv`（超时被忽略，由 embassy executor 的 `Timer` 驱动）。
+    #[cfg(feature = "std")]
+    async fn recv_timeout(&mut self, buf: &mut [u8], timeout: std::time::Duration) -> Result<usize, Self::Error> {
+        let _ = timeout;
+        self.recv(buf).await
+    }
 }
 
 // Allow the placeholder to be treated as a transport error for generic contexts.

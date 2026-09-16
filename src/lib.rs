@@ -70,7 +70,7 @@
 //! See `examples/const_topics_module.rs` and `examples/dynamic_topics_module.rs`
 //! for complete examples.
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 pub mod client;
 pub mod error;
 pub mod packet;

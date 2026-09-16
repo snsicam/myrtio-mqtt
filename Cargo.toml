@@ -13,6 +13,10 @@ v5 = []
 defmt = ["dep:defmt"]
 log = ["dep:log"]
 esp32-log = ["dep:esp-println"]
+# std 平台（RV1106 Linux）专属：让本库以 std 编译，从而使用 `std::time` 驱动的
+# `recv_timeout` 保活/tick（本项目用 futures::block_on，embassy-time 的 Timer 不会触发，
+# 见 rv1106-mqtt-client crate 注释）。no_std/embassy 目标不启用此 feature。
+std = []
 # embassy-net 传输（no_std/embassy 目标，如 ESP32）。std 平台（RV1106 Linux）
 # 走自定义 StdTcpTransport，不启用此 feature，避免拉入 embassy-executor-timer-queue。
 embassy-net = ["dep:embassy-net"]
