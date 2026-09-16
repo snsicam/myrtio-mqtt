@@ -3,10 +3,6 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Receiver;
 use embassy_time::{Duration, Instant};
-#[cfg(not(feature = "std"))]
-use embassy_futures::select::{Either, select};
-#[cfg(not(feature = "std"))]
-use embassy_time::Timer;
 
 use super::publisher::{BufferedOutbox, PublishRequest};
 use super::registry::TopicRegistry;
@@ -142,9 +138,7 @@ where
                 continue;
             }
 
-            #[cfg(feature = "std")]
-            {
-                // std 路径：把 tick 截止作为 recv 上限传给 poll()，不再依赖 embassy Timer。
+                // 把 tick 截止作为 recv 上限传给 poll()，不再依赖 embassy Timer。
                 // poll() 内部按真实时钟判保活；tick 到点后在此处（poll 返回）统一处理。
                 let now = Instant::now();
                 let remaining = if now >= tick_deadline {
@@ -174,49 +168,6 @@ where
                     self.drain_outbox(&mut outbox).await?;
                     tick_deadline = now + interval;
                 }
-            }
-
-            #[cfg(not(feature = "std"))]
-            {
-                // Calculate remaining time until tick
-                let now = Instant::now();
-                let remaining = if now >= tick_deadline {
-                    Duration::from_millis(0)
-                } else {
-                    tick_deadline - now
-                };
-
-                // Select between poll and tick timer
-                let timer_fut = Timer::after(remaining);
-                let poll_fut = self.client.poll(remaining);
-
-                match select(poll_fut, timer_fut).await {
-                    Either::First(result) => {
-                        // Incoming MQTT message or keep-alive handled
-                        match result {
-                            Ok(Some(MqttEvent::Publish(msg))) => {
-                                self.module.on_message(&msg);
-                                // If module needs immediate state publish after command
-                                if self.module.needs_immediate_publish() {
-                                    self.module.on_publish(&mut outbox);
-                                    self.drain_outbox(&mut outbox).await?;
-                                }
-                            }
-                            Ok(None) => {
-                                // No message, keep-alive was sent, continue
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Either::Second(()) => {
-                        // Tick timer expired - periodic tick for discovery
-                        let interval = self.module.on_tick(&mut outbox);
-                        self.drain_outbox(&mut outbox).await?;
-                        // Set next tick deadline
-                        tick_deadline = Instant::now() + interval;
-                    }
-                }
-            }
         }
     }
 

@@ -12,23 +12,13 @@
 //! # Object-Safe Design
 //!
 //! The `MqttModule` trait is designed to be dyn-compatible, allowing you to use
-//! `&mut dyn MqttModule` as a trait object. This is essential for `no_std`
-//! embedded environments where you want to:
-//!
-//! - Store modules in `StaticCell` and pass them to Embassy tasks
-//! - Avoid generic type parameters on task functions
-//! - Decouple runtime infrastructure from module-specific logic
+//! `&mut dyn MqttModule` as a trait object.
 //!
 //! # Publishing Pattern
 //!
 //! Modules never perform async I/O directly. Instead, they use the `PublishOutbox`
 //! trait to queue publish requests. The runtime then performs the actual async
 //! publishing after the module method returns.
-//!
-//! # Example
-//!
-//! See `examples/const_topics_module.rs` for a complete example of building
-//! a module with constant topics.
 
 pub(crate) mod event_loop;
 pub(crate) mod publisher;

@@ -7,8 +7,6 @@ use crate::error::{MqttError, ProtocolError};
 use crate::packet::{self, Connect, EncodePacket, MqttPacket, PingReq, Publish, QoS, Subscribe};
 use crate::transport::{self, MqttTransport};
 use embassy_time::{Duration, Instant};
-#[cfg(not(feature = "std"))]
-use embassy_time::Timer;
 use heapless::{String, Vec};
 
 /// Represents the MQTT protocol version used by the client.
@@ -93,6 +91,44 @@ impl<'a> MqttOptions<'a> {
 /// Maximum number of receive attempts when waiting for PUBACK/SUBACK.
 /// Skips interleaved packets (PingResp, Publish). Prevents infinite loop on broken connection.
 const MAX_RECV_ATTEMPTS: usize = 16;
+
+/// 返回缓冲中第一个 MQTT 报文的总线长（固定头 1B + 剩余长度变长字段 + 剩余长度）。
+/// 用于在同一 TCP 段合并多包时正确切分；不足一个完整变长头或变长非法时返回 None。
+fn first_packet_len(buf: &[u8]) -> Option<usize> {
+    if buf.is_empty() {
+        return None;
+    }
+    let mut multiplier = 1u32;
+    let mut value = 0u32;
+    let mut i = 1usize; // 跳过首字节（报文类型/标志）
+    loop {
+        if i >= buf.len() {
+            return None;
+        }
+        let b = buf[i];
+        value += ((b & 0x7f) as u32) * multiplier;
+        i += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+        multiplier = multiplier.checked_mul(128)?;
+        if i > 5 {
+            return None;
+        }
+    }
+    Some(1 + (i - 1) + value as usize)
+}
+
+/// 首包的分类（拥有所有权，不借用缓冲）。用于在拆包循环里决定如何推进游标，
+/// 避免「返回事件 / 推进 rx_off」与「缓冲借用」的冲突。
+enum PktKind {
+    PubAck,
+    SubAck { packet_id: u16, failed: bool },
+    PingResp,
+    Publish,
+    Other,
+}
+
 /// Maximum topic length for runtime-provided Last Will messages.
 const MAX_WILL_TOPIC_LEN: usize = 128;
 /// Maximum payload length for runtime-provided Last Will messages.
@@ -124,6 +160,11 @@ where
     options: MqttOptions<'a>,
     tx_buffer: [u8; BUF_SIZE],
     rx_buffer: [u8; BUF_SIZE],
+    // 收包游标：rx_buffer[rx_off..rx_len] 为尚未解析的字节（可能含同一 TCP 段合并的多个包）。
+    // 缓冲耗尽（rx_off == rx_len）时 poll()/publish() 重新 recv 并从头部填充；不足一个完整包时
+    // 继续 recv 追加，按 MQTT 变长头「已知长度」逐包解析，无需任何额外缓存。
+    rx_off: usize,
+    rx_len: usize,
     state: ConnectionState,
     last_tx_time: Instant,
     next_packet_id: u16,
@@ -140,6 +181,8 @@ where
             options,
             tx_buffer: [0; BUF_SIZE],
             rx_buffer: [0; BUF_SIZE],
+            rx_off: 0,
+            rx_len: 0,
             state: ConnectionState::Disconnected,
             last_tx_time: Instant::now(),
             next_packet_id: 1,
@@ -175,9 +218,6 @@ where
     where
         T::Error: transport::TransportError,
     {
-        #[cfg(feature = "esp32-log")]
-        esp_println::println!("MQTT: Starting connect...");
-
         self.state = ConnectionState::Connecting;
         let will = if let Some(will) = self.runtime_will.as_ref() {
             Some(LastWill {
@@ -201,36 +241,15 @@ where
             .encode(&mut self.tx_buffer, self.options.version)
             .map_err(MqttError::cast_transport_error)?;
 
-        #[cfg(feature = "esp32-log")]
-        esp_println::println!("MQTT TX ({} bytes): {:02X?}", len, &self.tx_buffer[..len]);
-
         self.transport.send(&self.tx_buffer[..len]).await?;
-
-        #[cfg(feature = "esp32-log")]
-        esp_println::println!("MQTT: Waiting for CONNACK...");
 
         let n = self.transport.recv(&mut self.rx_buffer).await?;
 
-        #[cfg(feature = "esp32-log")]
-        esp_println::println!("MQTT RX ({} bytes): {:02X?}", n, &self.rx_buffer[..n]);
-
         let packet = packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version);
-
-        #[cfg(feature = "esp32-log")]
-        if let Err(ref e) = packet {
-            esp_println::println!("MQTT decode error: {:?}", e);
-        }
 
         let packet = packet?.ok_or(MqttError::Protocol(ProtocolError::InvalidResponse))?;
 
         if let MqttPacket::ConnAck(connack) = packet {
-            #[cfg(feature = "esp32-log")]
-            esp_println::println!(
-                "MQTT CONNACK: reason_code={}, session_present={}",
-                connack.reason_code,
-                connack.session_present
-            );
-
             if connack.reason_code == 0 {
                 self.state = ConnectionState::Connected;
                 self.last_tx_time = Instant::now();
@@ -240,9 +259,6 @@ where
                 Err(MqttError::ConnectionRefused(connack.reason_code.into()))
             }
         } else {
-            #[cfg(feature = "esp32-log")]
-            esp_println::println!("MQTT: Expected CONNACK, got different packet!");
-
             self.state = ConnectionState::Disconnected;
             Err(MqttError::Protocol(ProtocolError::InvalidResponse))
         }
@@ -298,19 +314,41 @@ where
         self.transport.send(&self.tx_buffer[..len]).await?;
         self.last_tx_time = Instant::now();
 
-        // Wait for PUBACK if QoS > 0; skip interleaved PingResp/Publish to avoid race with keep-alive
+        // Wait for PUBACK if QoS > 0; skip interleaved PingResp/Publish to avoid race with keep-alive.
+        // broker 可能把 PUBACK 与下行 Publish（如 upgrade_query 的 DOWN 回复）合并进同一 TCP 段，
+        // 需逐包解析：遇到 PUBACK 即完成握手，并把段内残留字节暂存到 rx_leftover 由 poll() 消费，
+        // 否则残留的下行包会随下一次 recv() 被覆盖丢弃。
         if qos != QoS::AtMostOnce {
             for _ in 0..MAX_RECV_ATTEMPTS {
-                let n = self.transport.recv(&mut self.rx_buffer).await?;
-                let packet =
-                    packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version)?
-                        .ok_or(MqttError::Protocol(ProtocolError::InvalidResponse))?;
-
-                match packet {
-                    MqttPacket::PubAck(_) => return Ok(()),
-                    MqttPacket::PingResp => continue,
-                    MqttPacket::Publish(_) => continue,
-                    _ => return Err(MqttError::Protocol(ProtocolError::InvalidResponse)),
+                if self.rx_off >= self.rx_len {
+                    self.rx_off = 0;
+                    self.rx_len = 0;
+                }
+                match self.peek_kind()? {
+                    None => {
+                        // 不足一个完整包：recv 追加到缓冲末尾，下一轮再解析
+                        let n = self.transport.recv(&mut self.rx_buffer[self.rx_len..]).await?;
+                        self.rx_len += n;
+                        continue;
+                    }
+                    Some((PktKind::PubAck, total)) => {
+                        self.rx_off += total;
+                        #[cfg(feature = "log")]
+                        log::info!("PUBACK received, QoS1 publish handshake completed");
+                        return Ok(());
+                    }
+                    Some((PktKind::PingResp, total)) => {
+                        self.rx_off += total;
+                        continue;
+                    }
+                    Some((PktKind::Publish, total)) => {
+                        // 下行包在等 PUBACK 期间到达：保留在 rx_buffer 中，由 poll() 后续从 rx_off
+                        // 处解析。实际 PUBACK 必先于下行到达，正常在 PubAck 分支即返回；此处顺序异常
+                        // 时前移游标跳过（极端边缘，该 Publish 不交给 poll）。
+                        self.rx_off += total;
+                        continue;
+                    }
+                    Some((_, _)) => return Err(MqttError::Protocol(ProtocolError::InvalidResponse)),
                 }
             }
             return Err(MqttError::Protocol(ProtocolError::InvalidResponse));
@@ -337,30 +375,34 @@ where
         self.transport.send(&self.tx_buffer[..len]).await?;
         self.last_tx_time = Instant::now();
 
-        // Wait for SUBACK; skip interleaved PingResp/Publish to avoid race with keep-alive
+        // Wait for SUBACK; skip interleaved PingResp/Publish（与 publish 一致的游标拆包）
         for _ in 0..MAX_RECV_ATTEMPTS {
-            let n = self.transport.recv(&mut self.rx_buffer).await?;
-            let packet = packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version)?
-                .ok_or(MqttError::Protocol(ProtocolError::InvalidResponse))?;
-
-            match packet {
-                MqttPacket::SubAck(suback) => {
-                    if suback.packet_id != packet_id {
+            if self.rx_off >= self.rx_len {
+                self.rx_off = 0;
+                self.rx_len = 0;
+            }
+            match self.peek_kind()? {
+                None => {
+                    let n = self.transport.recv(&mut self.rx_buffer[self.rx_len..]).await?;
+                    self.rx_len += n;
+                    continue;
+                }
+                Some((PktKind::SubAck { packet_id: pid, failed }, total)) => {
+                    if failed || pid != packet_id {
                         return Err(MqttError::Protocol(ProtocolError::InvalidResponse));
                     }
-                    if suback
-                        .reason_codes
-                        .first()
-                        .map(|&c| c >= 0x80)
-                        .unwrap_or(true)
-                    {
-                        return Err(MqttError::Protocol(ProtocolError::InvalidResponse));
-                    }
+                    self.rx_off += total;
                     return Ok(());
                 }
-                MqttPacket::PingResp => continue,
-                MqttPacket::Publish(_) => continue,
-                _ => return Err(MqttError::Protocol(ProtocolError::InvalidResponse)),
+                Some((PktKind::PingResp, total)) => {
+                    self.rx_off += total;
+                    continue;
+                }
+                Some((PktKind::Publish, total)) => {
+                    self.rx_off += total;
+                    continue;
+                }
+                Some((_, _)) => return Err(MqttError::Protocol(ProtocolError::InvalidResponse)),
             }
         }
         Err(MqttError::Protocol(ProtocolError::InvalidResponse))
@@ -383,11 +425,73 @@ where
         Ok(())
     }
 
+/// 查看 `rx_buffer[rx_off..rx_len]` 处的第一个完整报文，**仅返回拥有所有权的类型描述与总线长**
+/// （不持有对缓冲的借用），调用方据此推进游标、必要时重新 decode 取真实报文，从而规避借用冲突。
+/// - `Ok(Some((kind, total)))`：解析到一个完整包，`total` 为其总线长；
+/// - `Ok(None)`：字节不足（首部或整包未收全），需继续 `recv` 追加；
+/// - `Err`：协议错误。
+fn peek_kind(&self) -> Result<Option<(PktKind, usize)>, MqttError<T::Error>>
+where
+    T::Error: transport::TransportError,
+{
+    let avail = self.rx_len - self.rx_off;
+    if avail < 2 {
+        return Ok(None);
+    }
+    let buf = &self.rx_buffer[self.rx_off..self.rx_len];
+    let total = match first_packet_len(buf) {
+        Some(l) => l,
+        None => return Ok(None), // 变长头不完整，需更多字节
+    };
+    if avail < total {
+        return Ok(None); // 整包未收全，需继续 recv
+    }
+    let kind = match packet::decode::<T::Error>(&buf[..total], self.options.version)? {
+        Some(MqttPacket::PubAck(_)) => PktKind::PubAck,
+        Some(MqttPacket::SubAck(s)) => {
+            let failed = s
+                .reason_codes
+                .first()
+                .map(|&c| c >= 0x80)
+                .unwrap_or(true);
+            PktKind::SubAck {
+                packet_id: s.packet_id,
+                failed,
+            }
+        }
+        Some(MqttPacket::PingResp) => PktKind::PingResp,
+        Some(MqttPacket::Publish(_)) => PktKind::Publish,
+        _ => PktKind::Other,
+    };
+    Ok(Some((kind, total)))
+}
+
+    /// 向 `rx_buffer` 末尾追加更多字节（写入 `[rx_len..]`），返回新增字节数；超时无数据返回 `0`。
+    /// 用 `recv_timeout`，等待时长取「保活剩余时间」与 `max_wait` 的较小者。
+    async fn recv_more(&mut self, max_wait: Duration) -> Result<usize, MqttError<T::Error>>
+    where
+        T::Error: transport::TransportError,
+    {
+        let keepalive_due = self.last_tx_time.elapsed() >= self.options.keep_alive;
+        let wait: std::time::Duration = if keepalive_due {
+            std::time::Duration::from_millis(0)
+        } else {
+            let rem = self.options.keep_alive - self.last_tx_time.elapsed();
+            std::time::Duration::from(rem)
+        }
+        .min(std::time::Duration::from(max_wait));
+
+        let buf = &mut self.rx_buffer[self.rx_len..];
+        match self.transport.recv_timeout(buf, wait).await {
+            Ok(n) => Ok(n),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Polls the connection for incoming packets and handles keep-alives.
     ///
     /// `max_wait` 是本次轮询的上限（由 runtime 传入 tick 截止时间）。std 构建下，保活与 tick
-    /// 均按真实时钟推进（不再依赖 embassy-time 的 `Timer`，后者在 `futures::block_on` 下不触发）；
-    /// no_std/embassy 构建下 `max_wait` 被忽略，保活改由内部 `Timer` 驱动。
+    /// 均按真实时钟推进（std 环境由 `std::time` 驱动，`futures::block_on` 下保活/tick 照常工作）。
     ///
     /// The returned `MqttEvent` contains references to the client's internal receive
     /// buffer. These references are only valid until the next call to `poll`.
@@ -402,85 +506,50 @@ where
             return Err(MqttError::NotConnected);
         }
 
-        enum PollDecision {
-            Received(usize),
-            KeepAlive,
-            Idle,
-        }
-
-        let decision = {
-            #[cfg(feature = "std")]
-            {
-                // std 路径：用 recv 超时 + 真实时钟保活，避免 embassy-time Timer 在
-                // futures::block_on 下不触发导致永不发 PINGREQ / 周期 tick 不跑。
-                let keepalive_due = self.last_tx_time.elapsed() >= self.options.keep_alive;
-                let wait: std::time::Duration = if keepalive_due {
-                    std::time::Duration::from_millis(0)
-                } else {
-                    let rem = self.options.keep_alive - self.last_tx_time.elapsed();
-                    std::time::Duration::from(rem)
-                }
-                .min(std::time::Duration::from(max_wait));
-
-                match self.transport.recv_timeout(&mut self.rx_buffer, wait).await {
-                    Ok(0) => {
-                        // 空闲超时：若已达保活时刻则发 PINGREQ，否则视为 tick 唤醒（Idle）。
-                        if self.last_tx_time.elapsed() >= self.options.keep_alive {
-                            PollDecision::KeepAlive
-                        } else {
-                            PollDecision::Idle
-                        }
-                    }
-                    Ok(n) => PollDecision::Received(n),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            #[cfg(not(feature = "std"))]
-            {
-                let elapsed = self.last_tx_time.elapsed();
-                let remaining = if elapsed >= self.options.keep_alive {
-                    Duration::from_millis(0)
-                } else {
-                    self.options.keep_alive - elapsed
-                };
-
-                let recv_fut = self.transport.recv(&mut self.rx_buffer);
-                let timer_fut = Timer::after(remaining);
-                match futures::future::select(core::pin::pin!(recv_fut), core::pin::pin!(timer_fut))
-                    .await
-                {
-                    futures::future::Either::Left((result, _)) => match result {
-                        Ok(n) => PollDecision::Received(n),
-                        Err(_) => PollDecision::Idle,
-                    },
-                    futures::future::Either::Right(((), _pending_recv)) => PollDecision::KeepAlive,
+        // 在 rx_buffer 上按 MQTT 变长头「已知长度」逐包解析（游标 rx_off/rx_len）。
+        // 同一 TCP 段合并的多个包会被依次解析：每次 poll 处理一个完整包，剩余字节留在缓冲，
+        // 由后续 poll 从 rx_off 处继续消费，绝不丢弃。不足一个完整包时 recv 追加。
+        // 先判断缓冲里是否已有完整包（仅用长度信息算拥有所有权的 bool，不持有缓冲借用）。
+        let has_full = {
+            let avail = self.rx_len - self.rx_off;
+            if avail < 2 {
+                false
+            } else {
+                match first_packet_len(&self.rx_buffer[self.rx_off..self.rx_len]) {
+                    Some(total) => avail >= total, // 已有完整包
+                    None => false,                 // 变长头都不完整
                 }
             }
         };
 
-        match decision {
-            PollDecision::Received(n) => {
-                if n == 0 {
-                    return Ok(None);
-                }
-
-                let packet =
-                    packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version)?;
-                if let Some(MqttPacket::Publish(packet)) = packet {
-                    return Ok(Some(MqttEvent::Publish(packet)));
-                }
-
-                Ok(None)
+        if !has_full {
+            // 字节不足一个完整包：缓冲耗尽则压缩到头部，再 recv 追加（带保活超时）
+            if self.rx_off >= self.rx_len {
+                self.rx_off = 0;
+                self.rx_len = 0;
             }
-            PollDecision::KeepAlive => {
-                #[cfg(feature = "esp32-log")]
-                esp_println::println!("MQTT: Sending PINGREQ");
-                self._send_packet(PingReq).await?;
-                #[cfg(feature = "esp32-log")]
-                esp_println::println!("MQTT: PINGREQ sent");
-                Ok(None)
+            let got = self.recv_more(max_wait).await?;
+            if got == 0 {
+                // 超时无数据：达保活时刻则发 PINGREQ，否则视为 tick 唤醒
+                if self.last_tx_time.elapsed() >= self.options.keep_alive {
+                    self._send_packet(PingReq).await?;
+                }
+                return Ok(None);
             }
-            PollDecision::Idle => Ok(None),
+            self.rx_len += got;
+        }
+
+        // 此刻缓冲里应有一个完整包：先取长度（仅 usize，不持有缓冲借用），推进游标后再解析返回，
+        // 避免「返回事件对 self 的借用」与「推进 rx_off 的可变借用」冲突。
+        let total = match first_packet_len(&self.rx_buffer[self.rx_off..self.rx_len]) {
+            Some(l) => l,
+            None => return Ok(None), // 仍不完整，等下次 poll 再 recv
+        };
+        let start = self.rx_off;
+        self.rx_off += total;
+        match packet::decode::<T::Error>(&self.rx_buffer[start..self.rx_off], self.options.version)? {
+            Some(MqttPacket::Publish(packet)) => Ok(Some(MqttEvent::Publish(packet))),
+            _ => Ok(None), // 非 Publish（PingResp 等）跳过，下次 poll 继续消费后续包
         }
     }
 

@@ -1,12 +1,12 @@
 //! # Async MQTT Client for Embedded Systems
 //!
-//! `myrtio-mqtt` is a `no_std` compatible, asynchronous MQTT client designed for embedded
-//! systems, built upon the [Embassy](https://embassy.dev/) async ecosystem.
+//! `myrtio-mqtt` is an asynchronous MQTT client for `std` (Linux) environments, built upon the
+//! [Embassy](https://embassy.dev/) async ecosystem's timers and synchronization primitives.
 //!
 //! ## Core Features
 //!
-//! - **`no_std` & `no_alloc`:** Designed to run on bare-metal microcontrollers without requiring a
-//!   standard library or dynamic memory allocation. Buffers are managed using `heapless`.
+//! - **Async & `std`:** Runs on Linux/std platforms (e.g. RV1106) using `std::time`-driven
+//!   `recv_timeout` keep-alive/tick. Buffers are managed with fixed-capacity `heapless` arrays.
 //! - **Fully Async:** Built with `async/await` and leverages the Embassy ecosystem for timers
 //!   and networking, ensuring non-blocking operations.
 //! - **Rust 2024 Edition:** Uses native `async fn` in traits, removing the need for `async-trait`.
@@ -37,20 +37,16 @@
 //! multiple concerns (Home Assistant, telemetry, OTA, etc.):
 //!
 //! ```ignore
-//! use myrtio_mqtt::runtime::{MqttModule, MqttRuntime, TopicRegistry, Context};
+//! use myrtio_mqtt::runtime::{MqttModule, MqttRuntime, TopicCollector};
 //!
 //! struct MyModule;
 //!
-//! impl<'a, T, const MAX_TOPICS: usize, const BUF_SIZE: usize>
-//!     MqttModule<'a, T, MAX_TOPICS, BUF_SIZE> for MyModule
-//! where
-//!     T: MqttTransport,
-//! {
-//!     fn register<'reg>(&'reg self, registry: &mut TopicRegistry<'reg, MAX_TOPICS>) {
-//!         let _ = registry.add("device/cmd");
+//! impl MqttModule for MyModule {
+//!     fn register(&self, collector: &mut dyn TopicCollector) {
+//!         collector.add("device/cmd");
 //!     }
 //!
-//!     fn on_message<'m>(&mut self, msg: &Publish<'m>) {
+//!     fn on_message(&mut self, msg: &Publish<'_>) {
 //!         // Handle incoming messages
 //!     }
 //! }
@@ -66,11 +62,7 @@
 //!
 //! The registry is only used during initial subscription and is dropped before
 //! the main event loop, so topics only need to live as long as the module.
-//!
-//! See `examples/const_topics_module.rs` and `examples/dynamic_topics_module.rs`
-//! for complete examples.
 
-#![cfg_attr(not(feature = "std"), no_std)]
 pub mod client;
 pub mod error;
 pub mod packet;
@@ -81,5 +73,3 @@ pub mod util;
 // Re-export key types for easier access at the crate root.
 pub use client::{LastWill, MqttClient, MqttEvent, MqttOptions};
 pub use packet::QoS;
-#[cfg(feature = "embassy-net")]
-pub use transport::TcpTransport;

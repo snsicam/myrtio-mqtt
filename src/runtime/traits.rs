@@ -6,10 +6,8 @@
 //! # Object Safety
 //!
 //! The `MqttModule` trait is designed to be dyn-compatible, meaning you can use
-//! `&mut dyn MqttModule<MAX_TOPICS>` as a trait object. This is essential for
-//! `no_std` embedded environments where you want to:
+//! `&mut dyn MqttModule` as a trait object. This lets you:
 //!
-//! - Store modules in `StaticCell` and pass them to Embassy tasks
 //! - Avoid generic type parameters on task functions
 //! - Decouple runtime infrastructure from module-specific logic
 //!
@@ -87,7 +85,7 @@ pub trait TopicCollector {
 /// # Object Safety
 ///
 /// This trait is designed to be dyn-compatible (`dyn MqttModule`),
-/// allowing modules to be stored as trait objects in `no_std` environments
+/// allowing modules to be stored as trait objects
 /// without heap allocation.
 ///
 /// Key design choices for object safety:

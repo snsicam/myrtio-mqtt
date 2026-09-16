@@ -1,12 +1,12 @@
 # myrtio-mqtt
 
-An async, `no_std`, `no_alloc` MQTT client for embedded systems, built on the [Embassy](https://embassy.dev/) ecosystem.
+An async MQTT client for `std` (Linux) environments, built on the [Embassy](https://embassy.dev/) ecosystem's timers and synchronization primitives.
 
 ## Features
 
-- **Async & `no_std`**: Designed for bare-metal microcontrollers (ESP32, etc.) and asynchronous execution.
+- **Async & `std`**: Runs on Linux/std platforms (e.g. RV1106) using `std::time`-driven `recv_timeout` keep-alive/tick.
 - **No Allocator Required**: Uses `heapless` for fixed-size buffers and internal state management.
-- **Transport Agnostic**: Works over TCP via `embassy-net`, UART, or any reliable stream-based channel via the `MqttTransport` trait.
+- **Transport Agnostic**: Works over TCP, UART, or any reliable stream-based channel via the `MqttTransport` trait. The application provides the transport (e.g. a std `TcpStream` wrapper).
 - **MQTT v3.1.1 & v5**: Core support for v3.1.1 with optional v5 support via feature flags.
 - **Modular Runtime**: High-level `MqttRuntime` for building applications using object-safe `MqttModule`s.
 
@@ -21,10 +21,11 @@ An async, `no_std`, `no_alloc` MQTT client for embedded systems, built on the [E
 Use `MqttClient` directly for simple, low-level control.
 
 ```rust
-use myrtio_mqtt::{MqttClient, MqttOptions, MqttEvent, QoS, TcpTransport};
+use myrtio_mqtt::{MqttClient, MqttOptions, MqttEvent, QoS};
 use embassy_time::Duration;
 
-let transport = TcpTransport::new(socket, Duration::from_secs(5));
+// `transport` is an application-provided `MqttTransport` (e.g. a std TcpStream wrapper).
+let transport = MyTcpTransport::connect("broker.local:1883")?;
 let options = MqttOptions::new("my-device-id");
 // Client with space for 8 subscriptions and 1024-byte buffers
 let mut client = MqttClient::<_, 8, 1024>::new(transport, options);
@@ -34,7 +35,7 @@ client.subscribe("sensors/data", QoS::AtMostOnce).await?;
 
 loop {
     // Poll handles keep-alives and incoming packets
-    if let Ok(Some(MqttEvent::Publish(msg))) = client.poll().await {
+    if let Ok(Some(MqttEvent::Publish(msg))) = client.poll(Duration::from_secs(1)).await {
         // Handle incoming message
         // msg.payload borrows from client.rx_buffer
     }
@@ -47,6 +48,7 @@ Use `MqttRuntime` to compose multiple independent features (Home Assistant, Tele
 ```rust
 use myrtio_mqtt::runtime::{MqttModule, TopicCollector, PublishOutbox};
 use myrtio_mqtt::packet::Publish;
+use myrtio_mqtt::QoS;
 use embassy_time::Duration;
 
 struct TelemetryModule;
@@ -72,7 +74,7 @@ impl MqttModule for TelemetryModule {
 ## Key Concepts
 
 - **Borrowed Payloads**: For efficiency, incoming `Publish` messages borrow their topic and payload directly from the client's internal receive buffer. They are only valid until the next call to `poll()` or until the module's `on_message` returns.
-- **Object-Safe Design**: The `MqttModule` trait is object-safe (`dyn MqttModule`), allowing you to store modules in `StaticCell`s or compose them using `ModulePair` without complex generic parameters.
+- **Object-Safe Design**: The `MqttModule` trait is object-safe (`dyn MqttModule`), allowing you to compose modules using `ModulePair` without complex generic parameters.
 - **Outbox Pattern**: To keep modules object-safe and synchronous, they do not perform async I/O. Instead, they queue publish requests into a `PublishOutbox`. The `MqttRuntime` performs the actual async publishing after the module callback completes.
 
 ### Quick API Reference
@@ -80,5 +82,5 @@ impl MqttModule for TelemetryModule {
 | Module | Key Types |
 |--------|-----------|
 | **Root** | `MqttClient`, `MqttOptions`, `MqttEvent`, `QoS` |
-| `transport` | `MqttTransport`, `TcpTransport` |
+| `transport` | `MqttTransport`, `TransportError` |
 | `runtime` | `MqttRuntime`, `MqttModule`, `TopicCollector`, `PublishOutbox`, `PublisherHandle` |

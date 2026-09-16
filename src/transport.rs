@@ -8,12 +8,6 @@
 //! need for the `#[async_trait]` macro.
 
 use crate::error::MqttError;
-#[cfg(feature = "embassy-net")]
-use embassy_net::tcp::{Error as TcpError, TcpSocket};
-#[cfg(feature = "embassy-net")]
-use embassy_time::{Duration, Timer};
-#[cfg(feature = "embassy-net")]
-use embedded_io_async::Write;
 
 /// A placeholder error type used in contexts where the actual transport error is not known,
 /// such as in the `EncodePacket` trait.
@@ -37,10 +31,9 @@ pub trait MqttTransport {
 
     /// 带超时的接收：至多阻塞 `timeout` 时间，超时且无数据时返回 `Ok(0)`（由调用方视为空闲）。
     ///
-    /// 仅 std 构建（RV1106 Linux）启用：`StdTcpTransport` 用 socket 读超时实现真实定时，
-    /// 使保活/周期 tick 在 `futures::block_on` 下照常工作（embassy-time 的 `Timer` 在此模型下
-    /// 不会触发）。无 std 时默认退化为 `recv`（超时被忽略，由 embassy executor 的 `Timer` 驱动）。
-    #[cfg(feature = "std")]
+    /// std 构建（RV1106 Linux）下 `StdTcpTransport` 用 socket 读超时实现真实定时，
+    /// 使保活/周期 tick 在 `futures::block_on` 下照常工作。此处默认实现退化为 `recv`
+    /// （忽略 `timeout`），传输层可覆写为带真实超时的版本。
     async fn recv_timeout(&mut self, buf: &mut [u8], timeout: std::time::Duration) -> Result<usize, Self::Error> {
         let _ = timeout;
         self.recv(buf).await
@@ -53,88 +46,5 @@ impl TransportError for ErrorPlaceHolder {}
 /// A marker trait for transport-related errors.
 pub trait TransportError: core::fmt::Debug {}
 
-// Implement TransportError for MqttError so TcpTransport works with client methods
+// Implement TransportError for MqttError so generic transports work with client methods
 impl<T: core::fmt::Debug> TransportError for MqttError<T> {}
-
-// Implement TransportError for embassy_net tcp error
-#[cfg(feature = "embassy-net")]
-impl TransportError for TcpError {}
-
-/// TCP transport implementation using `embassy-net`.
-#[cfg(feature = "embassy-net")]
-pub struct TcpTransport<'a> {
-    socket: TcpSocket<'a>,
-    timeout: Duration,
-}
-
-#[cfg(feature = "embassy-net")]
-impl<'a> TcpTransport<'a> {
-    /// Creates a new `TcpTransport` with the given socket and timeout.
-    pub fn new(socket: TcpSocket<'a>, timeout: Duration) -> Self {
-        Self { socket, timeout }
-    }
-
-    /// A helper function to perform a read with a timeout.
-    async fn read_with_timeout(
-        &mut self,
-        buf: &mut [u8],
-    ) -> Result<usize, MqttError<embassy_net::tcp::Error>> {
-        // Use `select` to race the read operation against a timer.
-        let read_fut = self.socket.read(buf);
-        let timer = Timer::after(self.timeout);
-
-        match futures::future::select(core::pin::pin!(read_fut), core::pin::pin!(timer)).await {
-            futures::future::Either::Left((Ok(n), _)) => {
-                #[cfg(feature = "esp32-log")]
-                esp_println::println!("TCP read: {} bytes", n);
-
-                if n == 0 {
-                    // If the peer closes the connection, read returns 0.
-                    #[cfg(feature = "esp32-log")]
-                    esp_println::println!("TCP connection closed by peer!");
-
-                    Err(MqttError::Protocol(
-                        super::error::ProtocolError::ConnectionClosed,
-                    ))
-                } else {
-                    Ok(n)
-                }
-            }
-            futures::future::Either::Left((Err(e), _)) => {
-                #[cfg(feature = "esp32-log")]
-                esp_println::println!("TCP read error: {:?}", e);
-
-                Err(MqttError::Transport(e))
-            }
-            futures::future::Either::Right(((), _)) => {
-                #[cfg(feature = "esp32-log")]
-                esp_println::println!("TCP read timeout!");
-
-                Err(MqttError::Timeout)
-            }
-        }
-    }
-}
-
-#[cfg(feature = "embassy-net")]
-impl<'a> MqttTransport for TcpTransport<'a> {
-    type Error = MqttError<embassy_net::tcp::Error>;
-
-    async fn send(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
-        #[cfg(feature = "esp32-log")]
-        esp_println::println!("TCP TX ({} bytes): {:02X?}", buf.len(), buf);
-
-        self.socket.write_all(buf).await.map_err(|e| {
-            #[cfg(feature = "esp32-log")]
-            esp_println::println!("TCP write error: {:?}", e);
-            MqttError::Transport(e)
-        })?;
-
-        // Flush to ensure data is actually sent to the network
-        self.socket.flush().await.map_err(MqttError::Transport)
-    }
-
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.read_with_timeout(buf).await
-    }
-}
