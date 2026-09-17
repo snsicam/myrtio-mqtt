@@ -11,6 +11,7 @@ use crate::client::MqttClient;
 use crate::error::MqttError;
 use crate::transport::{MqttTransport, TransportError};
 use crate::{MqttEvent, QoS};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The MQTT runtime that drives modules and handles the event loop.
 ///
@@ -85,16 +86,28 @@ where
         }
     }
 
-    /// Run the MQTT runtime event loop.
-    ///
-    /// This method:
-    /// 1. Connects to the MQTT broker
-    /// 2. Subscribes to all topics registered by the module
-    /// 3. Calls `on_start` for initial setup
-    /// 4. Enters the main loop handling messages, publishes, and ticks
-    ///
-    /// This method runs forever unless an error occurs.
+    /// Run the MQTT runtime event loop (forever, unless an error occurs).
     pub async fn run(&mut self) -> Result<(), MqttError<T::Error>> {
+        self.run_inner(None).await
+    }
+
+    /// Run the MQTT runtime event loop, but return `Ok(())` promptly when `abort` is set.
+    ///
+    /// 用于「配网成功切换网络」等场景主动中断当前会话、触发重连：`abort` 由外部
+    /// （如另一个线程）置位，runtime 在每次 tick 循环顶部检测到即主动返回 `Ok(())`
+    /// （视作「主动重连」而非错误断线，调用方可据此立即重连、不计入错误退避）。
+    ///
+    /// 必须在 `futures::executor::block_on` 单线程模型下可靠工作：本 runtime 的 tick 循环
+    /// 由 `StdTcpTransport::recv_timeout`（阻塞读超时）驱动、每 ~500ms 真实推进，`abort`
+    /// 检查点随之被可靠轮询——不依赖任何跨线程 waker 通知。
+    pub async fn run_until(&mut self, abort: &AtomicBool) -> Result<(), MqttError<T::Error>> {
+        self.run_inner(Some(abort)).await
+    }
+
+    async fn run_inner(
+        &mut self,
+        abort: Option<&AtomicBool>,
+    ) -> Result<(), MqttError<T::Error>> {
         if let Some(last_will) = self.module.last_will()
             && !self.client.set_last_will(last_will)
         {
@@ -130,6 +143,14 @@ where
 
         // Main event loop
         loop {
+            // 配网触发重连：外部置位 `abort` 即主动中断当前会话、立即返回（由调用方重连）。
+            // 置于循环顶部，确保每轮（~500ms）都能可靠检查到。
+            if let Some(ab) = abort {
+                if ab.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+            }
+
             // First, check for incoming publish requests (non-blocking)
             if let Ok(req) = self.publisher_rx.try_receive() {
                 self.client
