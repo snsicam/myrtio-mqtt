@@ -472,14 +472,17 @@ where
     where
         T::Error: transport::TransportError,
     {
-        let keepalive_due = self.last_tx_time.elapsed() >= self.options.keep_alive;
-        let wait: std::time::Duration = if keepalive_due {
-            std::time::Duration::from_millis(0)
-        } else {
-            let rem = self.options.keep_alive - self.last_tx_time.elapsed();
-            std::time::Duration::from(rem)
+        // 只取一次 elapsed：若「保活未到期」判断与「剩余时间计算」之间跨过保活边界，
+        // `keep_alive - elapsed` 会下溢 panic——这是 0 超时击穿会话之外的另一崩溃形态。
+        let since_tx = self.last_tx_time.elapsed();
+        if since_tx >= self.options.keep_alive {
+            // 保活已到期：立即返回 0，由 poll 补发 PINGREQ。绝不能把 0 作为超时
+            // 传给 transport——std 的 set_read_timeout(Some(0)) 返回 InvalidInput
+            // （"cannot set a 0 duration timeout"），会直接击穿 MQTT 会话造成断线。
+            return Ok(0);
         }
-        .min(std::time::Duration::from(max_wait));
+        let wait: std::time::Duration = std::time::Duration::from(self.options.keep_alive - since_tx)
+            .min(std::time::Duration::from(max_wait));
 
         let buf = &mut self.rx_buffer[self.rx_len..];
         match self.transport.recv_timeout(buf, wait).await {
